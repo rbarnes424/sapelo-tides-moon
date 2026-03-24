@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="Sapelo Tides"/>
+<title>Sapelo Island Tides</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{background:#0a1628;color:#e8f4ff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;padding-bottom:40px}
+.card{background:#0e213d;border:1px solid #1a3a60;border-radius:16px;padding:14px 16px;margin-bottom:14px}
+.label{font-size:11px;color:#6a9cc8;margin-bottom:4px;text-transform:uppercase}
+input[type=date],input[type=time]{background:transparent;border:none;color:#e8f4ff;font-size:15px;font-weight:600;width:100%;outline:none;font-family:inherit;-webkit-appearance:none}
+input::-webkit-calendar-picker-indicator{filter:invert(.7)}
+a{color:#60d0f8}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.row{display:flex;justify-content:space-between;align-items:center}
+.tag-h{color:#34d399} .tag-l{color:#f87171}
+.dim{color:#4a7a9a} .mid{color:#6a9cc8}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+"use strict";
+const DEG=Math.PI/180, SYNODIC=29.53059;
+function mod360(x){return((x%360)+360)%360}
+
+// ── Moon ──────────────────────────────────────────────
+function moonPhase(ds){
+  const[y,mo,d]=ds.split("-").map(Number);
+  const jd=new Date(y,mo-1,d,12).getTime()/86400000+2440587.5;
+  const T=(jd-2451545)/36525;
+  const ml=mod360(218.3164477+481267.88123421*T);
+  const sl=mod360(280.4664567+36000.76982779*T);
+  const el=mod360(ml-sl);
+  const pct=(1-Math.cos(el*DEG))/2;
+  const age=(el/360)*SYNODIC;
+  const P=[[1.85,"New Moon","🌑"],[5.54,"Waxing Crescent","🌒"],[9.22,"First Quarter","🌓"],
+           [12.91,"Waxing Gibbous","🌔"],[16.61,"Full Moon","🌕"],[20.30,"Waning Gibbous","🌖"],
+           [23.99,"Last Quarter","🌗"],[27.68,"Waning Crescent","🌘"],[99,"New Moon","🌑"]];
+  const[,name,emoji]=P.find(([l])=>age<l);
+  return{pct,age,name,emoji};
+}
+
+// ── Tides via NOAA API ────────────────────────────────
+const NOAA_STATION="8675622";
+
+async function fetchNoaaTides(ds){
+  const d8=ds.replace(/-/g,"");
+  const base="https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
+  const common=`station=${NOAA_STATION}&datum=MLLW&time_zone=lst_ldt&units=english&application=SapeloTidesApp&format=json`;
+
+  const [hiloRes, hourlyRes] = await Promise.all([
+    fetch(`${base}?begin_date=${d8}&end_date=${d8}&product=predictions&interval=hilo&${common}`),
+    fetch(`${base}?begin_date=${d8}&end_date=${d8}&product=predictions&interval=h&${common}`)
+  ]);
+
+  const [hiloJson, hourlyJson] = await Promise.all([hiloRes.json(), hourlyRes.json()]);
+
+  if(hiloJson.error||hourlyJson.error){
+    throw new Error(hiloJson.error?.message||hourlyJson.error?.message||"NOAA API error");
+  }
+
+  // Parse hi/lo
+  const hilo=(hiloJson.predictions||[]).map(p=>{
+    const[datePart,timePart]=p.t.split(" ");
+    const[h,m]=timePart.split(":").map(Number);
+    return{time:timePart,ft:+parseFloat(p.v).toFixed(2),type:p.type==="H"?"H":"L",hour:h+m/60};
+  });
+
+  // Parse hourly
+  const hourly=(hourlyJson.predictions||[]).map(p=>{
+    const[,timePart]=p.t.split(" ");
+    const[h,m]=timePart.split(":").map(Number);
+    return{hour:h+m/60,ft:+parseFloat(p.v).toFixed(2)};
+  });
+  // Add hour-0 point if missing
+  if(hourly.length&&hourly[0].hour>0) hourly.unshift({hour:0,ft:hourly[0].ft});
+
+  return{hourly,hilo};
+}
+
+// ── Sunrise / Sunset (NOAA solar algorithm) ───────────
+const SAP_LAT=31.3975, SAP_LON=-81.2936; // Sapelo Island
+
+function calcSun(ds){
+  const[y,mo,d]=ds.split("-").map(Number);
+  const jd=new Date(y,mo-1,d,12).getTime()/86400000+2440587.5;
+  const n=jd-2451545.0;
+  const L=mod360(280.460+0.9856474*n);
+  const g=mod360(357.528+0.9856003*n);
+  const lam=L+1.915*Math.sin(g*DEG)+0.020*Math.sin(2*g*DEG);
+  const eps=23.439-0.0000004*n;
+  const sinDec=Math.sin(eps*DEG)*Math.sin(lam*DEG);
+  const dec=Math.asin(sinDec)/DEG;
+  const RA=Math.atan2(Math.cos(eps*DEG)*Math.sin(lam*DEG),Math.cos(lam*DEG))/DEG;
+  // Equation of time (minutes)
+  const E=4*(L-RA-180*Math.floor((L-RA+180)/360));
+  // Hour angle for sunrise/sunset (standard -0.833° altitude)
+  const cosH=(Math.sin(-0.8333*DEG)-Math.sin(SAP_LAT*DEG)*Math.sin(dec*DEG))
+             /(Math.cos(SAP_LAT*DEG)*Math.cos(dec*DEG));
+  if(cosH>1)return{rise:null,set:null,noon:null}; // polar night
+  if(cosH<-1)return{rise:null,set:null,noon:null}; // midnight sun
+  const H=Math.acos(cosH)/DEG;
+  // Solar noon in UTC minutes
+  const noonUTC=720-4*SAP_LON-E;
+  const riseUTC=noonUTC-4*H;
+  const setUTC=noonUTC+4*H;
+  // Convert to local (Eastern: UTC-5 std, UTC-4 DST)
+  // Use JS to check if DST is in effect on this date
+  const tzOffset=-new Date(y,mo-1,d,12).getTimezoneOffset(); // minutes east
+  function utcToLocal(utcMin){
+    let m=utcMin+tzOffset;
+    if(m<0)m+=1440; if(m>=1440)m-=1440;
+    const h=Math.floor(m/60)%24, mn=Math.round(m%60);
+    return{h,mn,str:`${h%12||12}:${String(mn).padStart(2,"0")} ${h>=12?"PM":"AM"}`};
+  }
+  return{rise:utcToLocal(riseUTC),set:utcToLocal(setUTC),noon:utcToLocal(noonUTC)};
+}
+
+// ── Ferry ─────────────────────────────────────────────
+// Each day: sapelo[] = depart Sapelo times, meridian[] = depart Meridian times
+const FERRY={
+  0:{sapelo:["8:30 AM","4:00 PM"],meridian:["9:00 AM","4:30 PM"],sun2note:true},
+  1:{sapelo:["7:00 AM","12:00 PM","4:30 PM"],meridian:["8:30 AM","3:30 PM","5:30 PM"]},
+  2:{sapelo:["7:00 AM","2:30 PM","4:30 PM"],meridian:["8:30 AM","3:30 PM","5:30 PM"]},
+  3:{sapelo:["7:00 AM","12:00 PM","4:30 PM"],meridian:["8:30 AM","3:30 PM","5:30 PM"]},
+  4:{sapelo:["7:00 AM","2:30 PM","4:30 PM"],meridian:["8:30 AM","3:30 PM","5:30 PM"]},
+  5:{sapelo:["7:00 AM","12:00 PM","4:30 PM"],meridian:["8:30 AM","3:30 PM","5:30 PM"]},
+  6:{sapelo:["8:00 AM","12:30 PM","4:30 PM"],meridian:["9:00 AM","3:30 PM","5:30 PM"]},
+};
+const DAYS=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+function isHoliday(y,mo,d){
+  if(mo===1&&d===1)return"New Year's Day";
+  if(mo===12&&d===25)return"Christmas";
+  if(mo===11){const dt=new Date(y,10,1);const f=(11-dt.getDay())%7+1;if(d===f+21)return"Thanksgiving";}
+  if(mo===1){const dt=new Date(y,0,1);const f=(8-dt.getDay())%7+1;if(d===f+14)return"MLK Day";}
+  return null;
+}
+function isHolidaySched(y,mo,d){
+  if(mo===7&&d===4)return true;
+  if(mo===5){const l=new Date(y,5,0);if(d===l.getDate()-((l.getDay()+6)%7))return true;}
+  if(mo===9){const dt=new Date(y,8,1);if(d===(8-dt.getDay())%7+1)return true;}
+  return false;
+}
+function is12Sun(y,mo,d){
+  const dt=new Date(y,mo-1,d);if(dt.getDay()!==0)return false;
+  const f=new Date(y,mo-1,1);const s1=1+(7-f.getDay())%7;
+  return d===s1||d===s1+7;
+}
+function getFerry(ds){
+  const[y,mo,d]=ds.split("-").map(Number);
+  const hol=isHoliday(y,mo,d);
+  if(hol)return{sapelo:[],meridian:[],closed:hol};
+  if(isHolidaySched(y,mo,d))return{sapelo:["2:00 PM"],meridian:["2:30 PM"],closed:null,holSched:true};
+  const dow=new Date(y,mo-1,d).getDay();
+  const day=FERRY[dow]||{sapelo:[],meridian:[]};
+  let sapelo=[...day.sapelo];
+  let meridian=[...day.meridian];
+  // Add 1st/2nd Sunday extra run
+  if(dow===0&&is12Sun(y,mo,d)){
+    sapelo=["8:30 AM","2:00 PM","4:00 PM"];
+    meridian=["9:00 AM","2:30 PM","4:30 PM"];
+  }
+  return{sapelo,meridian,closed:null};
+}
+function parseT(ts){
+  const m=ts.match(/(\d+):(\d+)\s*(AM|PM)/i);if(!m)return null;
+  let h=parseInt(m[1]),mn=parseInt(m[2]);
+  if(m[3].toUpperCase()==="PM"&&h!==12)h+=12;
+  if(m[3].toUpperCase()==="AM"&&h===12)h=0;
+  return h+mn/60;
+}
+
+// ── Helpers ───────────────────────────────────────────
+function todayStr(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`}
+function nowStr(){const d=new Date();return`${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`}
+function fmtHr(h){const hr=Math.floor(h)%24,mn=Math.round((h%1)*60);return`${hr%12||12}:${String(mn).padStart(2,"0")} ${hr>=12?"PM":"AM"}`}
+function fmtHiLo(t){const[h,m]=t.split(":").map(Number);return`${h%12||12}:${String(m).padStart(2,"0")} ${h>=12?"PM":"AM"}`}
+function interp(hourly,tgt){
+  const b=[...hourly].reverse().find(d=>d.hour<=tgt);
+  const a=hourly.find(d=>d.hour>tgt);
+  if(b&&a)return+(b.ft+(tgt-b.hour)/(a.hour-b.hour)*(a.ft-b.ft)).toFixed(2);
+  return b?b.ft:a?a.ft:null;
+}
+function tColor(ft,lo,hi){const p=(ft-lo)/(hi-lo);return p>.66?"#34d399":p>.33?"#60d0f8":"#f87171"}
+function fmtShort(h){return h===0?"12A":h===12?"12P":`${h%12}${h>=12?"P":"A"}`}
+
+// ── SVG Chart ─────────────────────────────────────────
+function drawChart(canvas,hourly,hilo,tgt,spotColor){
+  if(!canvas||!hourly.length)return;
+  const dpr=window.devicePixelRatio||1;
+  const W=canvas.offsetWidth,H=160;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+"px";canvas.style.height=H+"px";
+  const ctx=canvas.getContext("2d");
+  ctx.scale(dpr,dpr);
+
+  const PL=36,PR=12,PT=22,PB=28;
+  const cW=W-PL-PR,cH=H-PT-PB;
+  const lo=Math.min(...hourly.map(d=>d.ft));
+  const hi=Math.max(...hourly.map(d=>d.ft));
+  const yLo=lo-0.3,yHi=hi+0.3;
+
+  function px(hr){return PL+((hr)/24)*cW}
+  function py(ft){return PT+cH-(ft-yLo)/(yHi-yLo)*cH}
+
+  // Grid
+  ctx.strokeStyle="#1a3a60";ctx.lineWidth=1;ctx.setLineDash([3,3]);
+  for(let v=Math.ceil(yLo);v<=yHi;v++){
+    ctx.beginPath();ctx.moveTo(PL,py(v));ctx.lineTo(W-PR,py(v));ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Area fill
+  const grad=ctx.createLinearGradient(0,PT,0,H-PB);
+  grad.addColorStop(0,"rgba(96,208,248,0.45)");
+  grad.addColorStop(1,"rgba(96,208,248,0.03)");
+  ctx.beginPath();
+  ctx.moveTo(px(0),py(hourly[0].ft));
+  for(let i=1;i<hourly.length;i++){
+    const p0=hourly[i-1],p1=hourly[i];
+    const cp=0.3*(px(p1.hour)-px(p0.hour));
+    ctx.bezierCurveTo(px(p0.hour)+cp,py(p0.ft),px(p1.hour)-cp,py(p1.ft),px(p1.hour),py(p1.ft));
+  }
+  ctx.lineTo(px(hourly[hourly.length-1].hour),H-PB);
+  ctx.lineTo(px(0),H-PB);ctx.closePath();
+  ctx.fillStyle=grad;ctx.fill();
+
+  // Line
+  ctx.beginPath();ctx.moveTo(px(0),py(hourly[0].ft));
+  for(let i=1;i<hourly.length;i++){
+    const p0=hourly[i-1],p1=hourly[i];
+    const cp=0.3*(px(p1.hour)-px(p0.hour));
+    ctx.bezierCurveTo(px(p0.hour)+cp,py(p0.ft),px(p1.hour)-cp,py(p1.ft),px(p1.hour),py(p1.ft));
+  }
+  ctx.strokeStyle="#60d0f8";ctx.lineWidth=2.5;ctx.stroke();
+
+  // Hi/Lo markers
+  hilo.forEach(h=>{
+    const col=h.type==="H"?"#34d399":"#f87171";
+    ctx.strokeStyle=col;ctx.lineWidth=1;ctx.setLineDash([3,3]);ctx.globalAlpha=0.7;
+    ctx.beginPath();ctx.moveTo(px(h.hour),PT);ctx.lineTo(px(h.hour),H-PB);ctx.stroke();
+    ctx.setLineDash([]);ctx.globalAlpha=1;
+    ctx.beginPath();ctx.arc(px(h.hour),py(h.ft),4,0,Math.PI*2);
+    ctx.fillStyle=col;ctx.fill();
+    ctx.fillStyle=col;ctx.font="bold 8px system-ui";ctx.textAlign="center";
+    ctx.fillText(h.ft.toFixed(1)+"'",px(h.hour),h.type==="H"?PT-5:H-PB+13);
+  });
+
+  // Current time
+  ctx.strokeStyle=spotColor;ctx.lineWidth=2;ctx.setLineDash([5,3]);
+  ctx.beginPath();ctx.moveTo(px(tgt),PT);ctx.lineTo(px(tgt),H-PB);ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle=spotColor;ctx.font="bold 9px system-ui";ctx.textAlign="center";
+  ctx.fillText(fmtHr(tgt),Math.min(px(tgt),W-PR-20),PT-5);
+
+  // Y labels
+  ctx.fillStyle="#4a7a9a";ctx.font="9px system-ui";ctx.textAlign="right";
+  for(let v=Math.ceil(yLo);v<=yHi;v++)ctx.fillText(v+"'",PL-4,py(v)+4);
+
+  // X labels
+  ctx.textAlign="center";
+  [0,3,6,9,12,15,18,21].forEach(h=>ctx.fillText(fmtShort(h),px(h),H-PB+13));
+}
+
+// ── Moon SVG string ───────────────────────────────────
+function moonSVG(age,size=52){
+  const r=size/2-1,cx=size/2,cy=size/2;
+  const termRx=Math.abs(Math.cos((age/SYNODIC)*Math.PI))*r;
+  const waning=age>=SYNODIC/2;
+  const L="#f5e882",D="#0a1628",ls=waning?0:1;
+  const ellipse=termRx>0.5?`<ellipse cx="${cx}" cy="${cy}" rx="${termRx}" ry="${r}" fill="${waning?L:D}"/>`:``; 
+  return`<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="${D}" stroke="#2a4a70" stroke-width="1"/>
+    <path d="M${cx} ${cy-r}A${r} ${r} 0 0 ${ls} ${cx} ${cy+r}Z" fill="${L}"/>
+    <path d="M${cx} ${cy-r}A${r} ${r} 0 0 ${1-ls} ${cx} ${cy+r}Z" fill="${D}"/>
+    ${ellipse}
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${L}" stroke-width=".4" stroke-opacity=".2"/>
+  </svg>`;
+}
+
+// ── Render ────────────────────────────────────────────
+let lastDate=null, cachedTides=null;
+
+async function render(){
+  const date=document.getElementById("inp-date").value;
+  const time=document.getElementById("inp-time").value;
+  const[hh,mm]=time.split(":").map(Number);
+  const tgt=hh+mm/60;
+
+  // Show loading state if new date
+  if(date!==lastDate){
+    document.getElementById("tide-status").textContent="Loading NOAA tide data...";
+    document.getElementById("tide-status").style.color="#6a9cc8";
+    try{
+      cachedTides=await fetchNoaaTides(date);
+      lastDate=date;
+      document.getElementById("tide-status").textContent="✓ NOAA official data";
+      document.getElementById("tide-status").style.color="#34d399";
+    }catch(err){
+      document.getElementById("tide-status").textContent="⚠️ Offline — no tide data. Connect to internet and reload.";
+      document.getElementById("tide-status").style.color="#f87171";
+      return;
+    }
+  }
+
+  const{hourly,hilo}=cachedTides;
+  const moon=moonPhase(date);
+  const spotFt=interp(hourly,tgt);
+  const lo=hourly.length?Math.min(...hourly.map(d=>d.ft)):0;
+  const hi=hourly.length?Math.max(...hourly.map(d=>d.ft)):9;
+  const sc=spotFt!==null?tColor(spotFt,lo,hi):"#60d0f8";
+  const gPct=spotFt!==null?Math.max(0,Math.min(100,((spotFt-lo)/(hi-lo))*100)):50;
+  const bef=[...hourly].reverse().find(d=>d.hour<=tgt);
+  const aft=hourly.find(d=>d.hour>tgt);
+  const dir=(bef&&aft)?(aft.ft>bef.ft?"Rising ↑":"Falling ↓"):"";
+  const nextEv=hilo.find(h=>h.hour>tgt);
+  const[y,mo,d]=date.split("-").map(Number);
+  const dow=new Date(y,mo-1,d).getDay();
+  const{sapelo,meridian,closed,holSched}=getFerry(date);
+
+  // Ferry next departure from either dock after current time
+  const nextSapeloIdx=sapelo.findIndex(t=>{const v=parseT(t);return v!==null&&v>tgt;});
+  const nextMeridianIdx=meridian.findIndex(t=>{const v=parseT(t);return v!==null&&v>tgt;});
+
+  const sun=calcSun(date);
+  document.getElementById("sun-rise").textContent=sun.rise?sun.rise.str:"—";
+  document.getElementById("sun-set").textContent=sun.set?sun.set.str:"—";
+
+  document.getElementById("moon-icon").innerHTML=moonSVG(moon.age,52);
+  document.getElementById("moon-name").textContent=moon.name;
+  document.getElementById("moon-detail").textContent=`${Math.round(moon.pct*100)}% illuminated · Day ${moon.age.toFixed(1)} of 29.5`;
+  document.getElementById("moon-bar-fill").style.height=`${moon.pct*100}%`;
+
+  if(spotFt!==null){
+    document.getElementById("spot-card").style.borderColor=sc+"55";
+    document.getElementById("spot-card").style.boxShadow=`0 0 18px ${sc}22`;
+    document.getElementById("spot-label").textContent=`Tide at ${fmtHr(tgt)}`;
+    document.getElementById("spot-ft").style.color=sc;
+    document.getElementById("spot-ft").textContent=spotFt.toFixed(2);
+    document.getElementById("spot-dir").textContent=dir;
+    document.getElementById("spot-next").textContent=nextEv?`Next ${nextEv.type==="H"?"High":"Low"}: ${nextEv.ft.toFixed(2)} ft @ ${fmtHiLo(nextEv.time)}`:"";
+    document.getElementById("spot-bar").style.width=`${gPct}%`;
+    document.getElementById("spot-bar").style.background=`linear-gradient(to right,#1a4a80,${sc})`;
+    document.getElementById("range-lo").textContent=`Low ${lo.toFixed(1)} ft`;
+    document.getElementById("range-hi").textContent=`High ${hi.toFixed(1)} ft`;
+    document.getElementById("gauge-fill").style.height=`${gPct}%`;
+    document.getElementById("gauge-fill").style.background=`linear-gradient(to top,${sc}aa,${sc}44)`;
+  }
+
+  // Chart
+  const canvas=document.getElementById("tide-canvas");
+  if(canvas){
+    setTimeout(()=>drawChart(canvas,hourly,hilo,tgt,sc),10);
+  }
+
+  // Hi/Lo table
+  const tbody=document.getElementById("hilo-body");
+  tbody.innerHTML=hilo.map((h,i)=>{
+    const isN=nextEv&&h.time===nextEv.time;
+    const col=h.type==="H"?"#34d399":"#f87171";
+    return`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;${i<hilo.length-1?"border-bottom:1px solid #132035;":""}background:${isN?"#0d2a4a":"transparent"}">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:28px;height:28px;border-radius:8px;background:${col}22;display:flex;align-items:center;justify-content:center;color:${col};font-size:13px">${h.type==="H"?"▲":"▼"}</div>
+        <div>
+          <div style="font-weight:700;color:${col};font-size:15px">${h.type==="H"?"High":"Low"} Tide</div>
+          <div style="font-size:11px;color:#4a7a9a">${fmtHiLo(h.time)}${isN?"  ← next":""}</div>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-weight:700;font-size:19px;color:#e8f4ff">${h.ft.toFixed(2)}</div>
+        <div style="font-size:11px;color:#4a7a9a">feet MLLW</div>
+      </div>
+    </div>`;
+  }).join("");
+
+  // Ferry
+  const ferryBody=document.getElementById("ferry-body");
+  const ferryDate=document.getElementById("ferry-date");
+  ferryDate.textContent=`${DAYS[dow]}, ${new Date(y,mo-1,d).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})} · Meridian ↔ Sapelo`;
+  if(closed){
+    ferryBody.innerHTML=`<div style="background:#2a1020;border:1px solid #f87171;border-radius:10px;padding:10px 12px;color:#f87171;font-size:13px">⚠️ No ferry service today (${closed})</div>`;
+  } else {
+    const maxRows=Math.max(sapelo.length,meridian.length);
+    const rows=Array.from({length:maxRows},(_,i)=>{
+      const s=sapelo[i]||"—";
+      const m=meridian[i]||"—";
+      const sNext=i===nextSapeloIdx;
+      const mNext=i===nextMeridianIdx;
+      return`<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:9px 10px;margin-bottom:4px;border-radius:10px;background:#091828;border:1px solid #1a3050">
+        <div style="font-weight:700;color:${sNext?"#f5e882":"#34d399"};font-size:14px">${s}${sNext?" ←":""}</div>
+        <div style="font-weight:700;color:${mNext?"#f5e882":"#60d0f8"};font-size:14px">${m}${mNext?" ←":""}</div>
+      </div>`;
+    }).join("");
+
+    ferryBody.innerHTML=`
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;padding:0 2px">
+        <div style="font-size:10px;color:#34d399;font-weight:700;text-transform:uppercase">🏝 Depart Sapelo</div>
+        <div style="font-size:10px;color:#60d0f8;font-weight:700;text-transform:uppercase">⚓ Depart Meridian</div>
+      </div>
+      ${rows}
+      ${holSched?`<div style="font-size:10px;color:#4a7a9a;margin-top:6px">Holiday schedule — limited service</div>`:""}
+      ${dow===0&&!is12Sun(...date.split("-").map(Number))?`<div style="font-size:10px;color:#4a7a9a;margin-top:6px">* 2:00 PM / 2:30 PM runs on 1st & 2nd Sunday only</div>`:""}
+      <div style="font-size:10px;color:#4a7a9a;margin-top:6px">No service: New Year's, MLK Day, Thanksgiving, Christmas · Holiday sched: Mem Day, Jul 4, Labor Day</div>`;
+  }
+}
+
+// ── Build DOM ─────────────────────────────────────────
+document.getElementById("root").innerHTML=`
+<div style="background:linear-gradient(135deg,#0d2a50,#0a3060);padding:18px 20px 14px;border-bottom:1px solid #1a4070;box-shadow:0 2px 12px #0007;margin-bottom:0">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="font-size:24px">🌊</span>
+    <div>
+      <div style="font-weight:700;font-size:17px;color:#e8f4ff">Sapelo Island</div>
+      <div style="font-size:11px;color:#6a9cc8">Tides · Ferry · Moon · NOAA #8675622</div>
+    </div>
+  </div>
+</div>
+
+<div style="padding:16px 16px 0">
+
+  <div style="font-size:11px;color:#6a9cc8;text-align:right;margin-bottom:10px" id="tide-status">Loading NOAA tide data...</div>
+    <div class="card" style="margin-bottom:0">
+      <div class="label">📅 Date</div>
+      <input type="date" id="inp-date" value="${todayStr()}">
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="label">🕐 Time</div>
+      <input type="time" id="inp-time" value="${nowStr()}">
+    </div>
+  </div>
+
+  <div class="card" id="sun-card" style="display:flex;align-items:center;gap:0;margin-bottom:14px">
+    <div style="flex:1;text-align:center;border-right:1px solid #1a3a60;padding-right:12px">
+      <div class="label">🌅 Sunrise</div>
+      <div id="sun-rise" style="font-size:22px;font-weight:700;color:#f5c842"></div>
+    </div>
+    <div style="flex:1;text-align:center;padding-left:12px">
+      <div class="label">🌇 Sunset</div>
+      <div id="sun-set" style="font-size:22px;font-weight:700;color:#f5a642"></div>
+    </div>
+  </div>
+    <div style="flex:1">
+      <div class="label">Moon Phase</div>
+      <div id="moon-name" style="font-size:20px;font-weight:700;color:#f5e882;line-height:1.1"></div>
+      <div id="moon-detail" style="font-size:12px;color:#8ab;margin-top:4px"></div>
+    </div>
+    <div style="width:6px;height:54px;background:#071525;border-radius:3px;position:relative;overflow:hidden;border:1px solid #1a3a60">
+      <div id="moon-bar-fill" style="position:absolute;bottom:0;left:0;right:0;background:linear-gradient(to top,#c8b840,#f5e882)"></div>
+    </div>
+  </div>
+
+  <div class="card" id="spot-card" style="border:1.5px solid #1a3a60">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div>
+        <div class="label" id="spot-label">Tide</div>
+        <div style="font-size:42px;font-weight:800;line-height:1" id="spot-ft"></div>
+        <div style="font-size:18px;font-weight:400;color:#8ab;margin-top:-4px">feet</div>
+        <div style="font-size:13px;color:#8ab;margin-top:4px">
+          <span id="spot-dir" style="margin-right:10px"></span>
+          <span id="spot-next"></span>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
+        <div style="width:18px;height:80px;background:#071525;border-radius:9px;border:1px solid #1a4070;position:relative;overflow:hidden">
+          <div id="gauge-fill" style="position:absolute;bottom:0;left:0;right:0"></div>
+        </div>
+        <div style="font-size:9px;color:#6a9cc8">MLLW</div>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <div style="height:5px;background:#071525;border-radius:3px;position:relative;border:1px solid #1a3a60">
+        <div id="spot-bar" style="position:absolute;left:0;top:0;bottom:0;border-radius:3px"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#6a9cc8;margin-top:3px">
+        <span id="range-lo"></span><span id="range-hi"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="padding:14px 8px 10px 4px">
+    <div style="font-size:12px;color:#6a9cc8;padding-left:12px;margin-bottom:6px">24-Hour Tide Curve</div>
+    <canvas id="tide-canvas" style="width:100%;display:block"></canvas>
+  </div>
+
+  <div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:12px 16px 8px;font-size:12px;color:#6a9cc8;border-bottom:1px solid #1a3a60">High & Low Tides</div>
+    <div id="hilo-body"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="font-size:18px">⛴️</span>
+      <div>
+        <div style="font-weight:700;font-size:15px">Ferry Schedule</div>
+        <div id="ferry-date" style="font-size:11px;color:#6a9cc8"></div>
+      </div>
+    </div>
+    <div id="ferry-body"></div>
+  </div>
+
+  <div style="background:#0a1825;border:1px solid #1a3050;border-radius:10px;padding:10px 14px;font-size:11px;color:#4a7a9a;line-height:1.6">
+    ⚠️ Tides: harmonic model ±30 min / ±0.3 ft. Verify at <a href="https://tidesandcurrents.noaa.gov/noaatidepredictions.html?id=8675622" target="_blank">NOAA ↗</a> and <a href="https://ugami.uga.edu/ferry/" target="_blank">UGA ferry schedule ↗</a>
+  </div>
+</div>
+`;
+
+// Events
+document.getElementById("inp-date").addEventListener("change",()=>render());
+document.getElementById("inp-time").addEventListener("change",()=>render());
+window.addEventListener("resize",()=>{ if(cachedTides) render(); });
+render();
+</script>
+</body>
+</html>
